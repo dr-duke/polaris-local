@@ -279,6 +279,9 @@ class Kettle(DeviceListener, ConnectionStatusListener):
         self.device_token = device_token
         self.conn = None
         self.conn_status = None
+        # Public key the current session was negotiated with. The kettle rolls its
+        # key over when it reboots, which silently invalidates the session.
+        self._session_pubkey = None
         self._read_timeout = read_timeout
         self._find_evt = threading.Event()
         self._logger = logging.getLogger(f'{__name__}.{self.__class__.__name__}[{mac}]')  # Добавляем MAC в логгер
@@ -326,6 +329,23 @@ class Kettle(DeviceListener, ConnectionStatusListener):
             hasattr(current_service_info, 'properties') and 
             current_service_info.properties):
             
+            # A rebooted kettle announces itself with a freshly generated public
+            # key. The running session still holds the keys derived from the old
+            # one, so every frame fails to decrypt ("Invalid padding bytes") until
+            # the connection is rebuilt. Drop it here; the coordinator starts a new
+            # one on its next cycle, reading the current key.
+            if self.conn is not None and self._session_pubkey is not None:
+                try:
+                    current_pubkey = self.device.pubkey
+                except Exception as exc:
+                    current_pubkey = None
+                    self._logger.debug(f"Could not read public key on update: {exc}")
+                if current_pubkey is not None and current_pubkey != self._session_pubkey:
+                    self._logger.warning(
+                        "Device public key changed (%s… -> %s…), reconnecting",
+                        self._session_pubkey.hex()[:12], current_pubkey.hex()[:12])
+                    self.force_reconnect()
+
             # Уведомляем координатор об обновлении устройства
             if hasattr(self, '_coordinator_listener'):
                 try:
@@ -453,6 +473,7 @@ class Kettle(DeviceListener, ConnectionStatusListener):
             # Обновляем параметры существующего соединения
             self.conn.set_address(self.device.addr, self.device.port)
             self.conn.set_device_pubkey(self.device.pubkey)
+            self._session_pubkey = self.device.pubkey
             return
     
         # Проверяем что device имеет все необходимые свойства
@@ -485,6 +506,7 @@ class Kettle(DeviceListener, ConnectionStatusListener):
             self.conn.add_connection_status_listener(connection_status_listener)
     
         self.conn.start()
+        self._session_pubkey = self.device.pubkey
         self._logger.info("New UDP connection started")
 
     def stop_all(self):
